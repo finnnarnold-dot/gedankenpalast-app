@@ -1,0 +1,46 @@
+# Startet den iPhone/iPad-Bau neu, wenn GitHub keinen freien Mac hatte (Job nie gestartet).
+# Läuft auf einem kostenlosen Linux-Rechner; höchstens 6 Versuche, abwechselnd macos-15 und macos-26.
+name: iOS-Bau wiederholen
+
+on:
+  workflow_run:
+    workflows: ['iPhone/iPad-App bauen']
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    if: github.event.workflow_run.conclusion != 'success' && github.repository == 'finnnarnold-dot/gedankenpalast-app'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Prüfen und neu starten (bis zu 6 Versuche in diesem einen Lauf)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.event.workflow_run.id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Hinweis: Von hier gestartete Läufe lösen KEIN neues workflow_run aus (GITHUB_TOKEN) –
+          # deshalb wartet dieser Lauf selbst auf jeden Versuch und startet bei Bedarf den nächsten.
+          never_ran() { [ "$(gh api "repos/$REPO/actions/runs/$1/jobs" --jq '[.jobs[] | select(.name=="build") | .steps[]? | select(.conclusion != null and .conclusion != "skipped")] | length')" = 0 ]; }
+          newest() { gh api "repos/$REPO/actions/workflows/ios.yml/runs?branch=$BRANCH&per_page=1" --jq '.workflow_runs[0].head_sha'; }
+          [ "$(newest)" = "$SHA" ] || { echo "Neuerer Stand vorhanden – kein Neustart"; exit 0; }
+          never_ran "$RUN" || { echo "Bau lief und ist fehlgeschlagen – das muss im Code behoben werden"; exit 0; }
+          for n in 1 2 3 4 5 6; do
+            runner=$([ $((n % 2)) = 1 ] && echo macos-26 || echo macos-15)
+            echo "Kein freier Mac – Versuch $n in 30 Sekunden auf $runner"
+            sleep 30
+            before=$(gh api "repos/$REPO/actions/workflows/ios.yml/runs?per_page=1" --jq '.workflow_runs[0].id')
+            gh workflow run ios.yml --repo "$REPO" --ref "$BRANCH" -f runner="$runner" -f attempt="$n"
+            id=$before
+            for _ in $(seq 1 30); do sleep 10; id=$(gh api "repos/$REPO/actions/workflows/ios.yml/runs?per_page=1" --jq '.workflow_runs[0].id'); [ "$id" != "$before" ] && break; done
+            [ "$id" = "$before" ] && { echo "Neuer Lauf nicht gefunden"; exit 1; }
+            gh run watch "$id" --repo "$REPO" >/dev/null 2>&1 || true
+            [ "$(newest)" = "$SHA" ] || { echo "Neuerer Stand vorhanden – aufgehört"; exit 0; }
+            if ! never_ran "$id"; then echo "Versuch $n lief auf einem Mac (Lauf $id)"; exit 0; fi
+          done
+          echo "6 Versuche ohne freien Mac – aufgegeben"; exit 1

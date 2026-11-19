@@ -1,0 +1,18 @@
+name: TestFlight-Abstürze
+on: workflow_dispatch
+jobs:
+  crashes:
+    if: github.repository == 'finnnarnold-dot/gedankenpalast-app'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Absturzberichte holen
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          pip install -q pyjwt cryptography
+          python .github/scripts/asc_crashes.py
+          rm -f "$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"

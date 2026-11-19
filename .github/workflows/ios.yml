@@ -1,0 +1,235 @@
+# Baut die iPhone/iPad-App auf einem Mac von GitHub (kein eigener Mac nötig).
+# * Ohne Schlüssel: Prüfbau für den Simulator (zeigt, dass alles fehlerfrei übersetzt).
+# * Mit Schlüsseln (Repository-Geheimnisse, siehe docs/IOS-APP.md): unterschreiben und zu TestFlight hochladen.
+# Läuft nur, wenn sich an der App etwas ändert (spart Mac-Minuten), monatlich neu (TestFlight-Builds laufen nach 90 Tagen ab)
+# oder von Hand über „Run workflow“.
+name: iPhone/iPad-App bauen
+run-name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.attempt != '0' && format('iPhone/iPad-App bauen (Versuch {0}, {1})', github.event.inputs.attempt, github.event.inputs.runner) || github.event.head_commit.message || 'iPhone/iPad-App bauen' }}
+
+on:
+  push:
+    branches: [main, ios-nativ]
+    paths: ['ios/**', 'VERSION', '.github/workflows/ios.yml']
+  schedule:
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Mac-Typ (Xcode 26 nötig: macos-26 oder macos-15)'
+        required: false
+        default: 'macos-15'
+      attempt:
+        description: 'Versuch (wird bei automatischer Wiederholung hochgezählt)'
+        required: false
+        default: '0'
+
+# Neuer Stand auf demselben Zweig ersetzt einen noch laufenden Bau (spart Mac-Minuten)
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Gebaut wird nur im öffentlichen App-Repository finnnarnold-dot/gedankenpalast-app (dort sind Mac-Rechner kostenlos);
+    # das private Repository schiebt den App-Teil mit tools/app_repo_sync.sh dorthin.
+    if: github.repository == 'finnnarnold-dot/gedankenpalast-app'
+    # Unterschreiben braucht ein eigenes Zertifikat je Lauf – Apple erlaubt nur eins gleichzeitig, daher nacheinander
+    concurrency:
+      group: ios-signing
+      cancel-in-progress: false
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}   # hat Xcode 26; bei Wartezeiten macos-26 wählen
+    timeout-minutes: 40
+    env:
+      HAS_KEYS: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_ISSUER_ID != '' && secrets.ASC_KEY_P8 != '' && secrets.APPLE_TEAM_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versionsnummer aus dem Portal
+        run: |
+          # privates Repository: aus portal/config.py; öffentliches App-Repository: Datei VERSION (+ BUILD_OFFSET)
+          if [ -f VERSION ]; then V=$(cat VERSION); else V=$(python3 -c 'import re;print(re.search(r"VERSION = \"([^\"]+)\"", open("portal/config.py").read()).group(1))'); fi
+          B=$(( GITHUB_RUN_NUMBER + $(cat BUILD_OFFSET 2>/dev/null || echo 0) ))
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NO=$B" >> "$GITHUB_ENV"
+          echo "Version $V, Build $B"
+      - name: Neuestes Xcode wählen (Apple verlangt für TestFlight Xcode 26 / iOS-26-SDK)
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_[0-9]*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X"; fi
+          xcodebuild -version
+      - name: Xcode-Projekt erzeugen (XcodeGen)
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+      - name: Prüfbau (Simulator, ohne Unterschrift)
+        run: |
+          set -o pipefail
+          cd ios
+          xcodebuild -project Studienportal.xcodeproj -scheme Studienportal -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            MARKETING_VERSION="$APP_VERSION" CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 \
+            || { grep -E "error:|warning: .*will be an error" build.log | sort -u | head -40; tail -20 build.log; exit 1; }
+          tail -5 build.log
+      - name: Für TestFlight bauen, unterschreiben und hochladen
+        if: env.HAS_KEYS == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -o pipefail
+          KEY="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY"
+          # Prüfen, ob Apple den Schlüssel annimmt (zeigt nur Ja/Nein, keine Geheimnisse)
+          mkdir -p ~/.appstoreconnect/private_keys && cp "$KEY" ~/.appstoreconnect/private_keys/
+          python3 -m venv "$RUNNER_TEMP/py" && "$RUNNER_TEMP/py/bin/pip" install --quiet pyjwt cryptography || true
+          "$RUNNER_TEMP/py/bin/python" - <<'PY' || true
+          import os, time, json, urllib.request
+          try:
+              import jwt
+              tok = jwt.encode({"iss": os.environ["ASC_ISSUER_ID"], "iat": int(time.time()), "exp": int(time.time()) + 600, "aud": "appstoreconnect-v1"},
+                               open(os.environ["RUNNER_TEMP"] + "/AuthKey_" + os.environ["ASC_KEY_ID"] + ".p8").read(), algorithm="ES256",
+                               headers={"kid": os.environ["ASC_KEY_ID"], "typ": "JWT"})
+              # Kennung der Widgets einmalig bei Apple registrieren (Xcode kann das mit dem Schlüssel nicht selbst)
+              def api(path, body=None):
+                  req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/" + path, data=json.dumps(body).encode() if body else None,
+                                               headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+                  return json.load(urllib.request.urlopen(req, timeout=30))
+              have = [x["attributes"]["identifier"] for x in api("bundleIds?limit=200")["data"]]
+              for ident, name in (("de.finnarnold.studienportal.widgets", "Studienportal Widgets"),):
+                  if ident not in have:
+                      try:
+                          api("bundleIds", {"data": {"type": "bundleIds", "attributes": {"identifier": ident, "name": name, "platform": "IOS"}}})
+                          print("Registriert:", ident)
+                      except urllib.error.HTTPError as e:
+                          print("Registrieren fehlgeschlagen:", ident, e.code, e.read()[:300])
+              # Freischaltungen der App-ID anzeigen (App Groups, iCloud, MusicKit …)
+              try:
+                  b = api("bundleIds?filter[identifier]=de.finnarnold.studienportal&include=bundleIdCapabilities")
+                  caps = [x["attributes"].get("capabilityType") for x in b.get("included", [])]
+                  print("Freigeschaltet für de.finnarnold.studienportal:", sorted(c for c in caps if c))
+                  for x in b.get("included", []):
+                      if x["attributes"].get("settings"):
+                          print("  ", x["attributes"].get("capabilityType"), json.dumps(x["attributes"]["settings"])[:300])
+              except Exception as e:
+                  print("Freischaltungen nicht lesbar:", e)
+              for path in ("apps?limit=5", "bundleIds?limit=20"):
+                  try:
+                      r = urllib.request.urlopen(urllib.request.Request("https://api.appstoreconnect.apple.com/v1/" + path, headers={"Authorization": "Bearer " + tok}), timeout=30)
+                      d = json.load(r)["data"]
+                      print("Schlüssel OK:", path, [x["attributes"].get("bundleId") or x["attributes"].get("identifier") for x in d])
+                  except urllib.error.HTTPError as e:
+                      print("Apple lehnt ab:", path, e.code, e.read()[:300])
+          except Exception as e:
+              print("Prüfung nicht möglich:", e)
+          PY
+          AUTH=(-authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          # Eigenes Zertifikat + Profile über Apples Schnittstelle (Apples Automatik scheitert an App-Gruppe/iCloud)
+          "$RUNNER_TEMP/py/bin/python" .github/scripts/asc_signing.py setup
+          APP_PROFILE=$(python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_TEMP"]+"/profiles.json"))["de.finnarnold.studienportal"])')
+          WIDGET_PROFILE=$(python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_TEMP"]+"/profiles.json"))["de.finnarnold.studienportal.widgets"])')
+          SHARE_PROFILE=$(python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_TEMP"]+"/profiles.json"))["de.finnarnold.studienportal.share"])')
+          cd ios
+          # Archiv ohne Unterschrift bauen; Berechtigungen vorläufig eintragen – der Export unterschreibt endgültig
+          xcodebuild -project Studienportal.xcodeproj -scheme Studienportal -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/Studienportal.xcarchive archive \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" MARKETING_VERSION="$APP_VERSION" CURRENT_PROJECT_VERSION="$BUILD_NO" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" > archive.log 2>&1 \
+            || { grep -E "error:" archive.log | sort -u | head -30; tail -20 archive.log; exit 1; }
+          tail -3 archive.log
+          APP=build/Studienportal.xcarchive/Products/Applications/Studienportal.app
+          sed -i '' "s/\$(AppIdentifierPrefix)/$APPLE_TEAM_ID./g" App/Studienportal.entitlements Widgets/Widgets.entitlements ShareExtension/ShareExtension.entitlements
+          # Berechtigungen so eintragen, wie Apple sie der App-ID zugeordnet hat (Namen aus dem Profil; Fehlendes weglassen)
+          python3 - App/Studienportal.entitlements <<'PY'
+          import json, os, plistlib, sys
+          p = sys.argv[1]
+          caps = json.load(open(os.environ["RUNNER_TEMP"] + "/caps.json"))["de.finnarnold.studienportal"]
+          e = plistlib.load(open(p, "rb"))
+          for k in ("com.apple.security.application-groups", "com.apple.developer.icloud-container-identifiers",
+                    "com.apple.developer.ubiquity-container-identifiers", "com.apple.developer.icloud-services",
+                    "com.apple.developer.icloud-container-environment", "aps-environment"):
+              e.pop(k, None)
+          if caps["groups"]: e["com.apple.security.application-groups"] = caps["groups"]
+          if caps["icloud"]:
+              e["com.apple.developer.icloud-container-identifiers"] = caps["icloud"]
+              e["com.apple.developer.ubiquity-container-identifiers"] = caps["icloud"]
+              e["com.apple.developer.icloud-services"] = ["CloudDocuments"]
+              e["com.apple.developer.icloud-container-environment"] = "Production"
+          if caps["push"]: e["aps-environment"] = "production"
+          plistlib.dump(e, open(p, "wb"))
+          print("Berechtigungen:", {k: v for k, v in e.items() if k != "keychain-access-groups"})
+          PY
+          codesign -f -s - --entitlements Widgets/Widgets.entitlements "$APP/PlugIns/Widgets.appex"
+          codesign -f -s - --entitlements ShareExtension/ShareExtension.entitlements "$APP/PlugIns/ShareExtension.appex"
+          codesign -f -s - --entitlements App/Studienportal.entitlements "$APP"
+          DEST=$([ "$GITHUB_REF" = "refs/heads/main" ] && echo upload || echo export)
+          echo "Ziel: $DEST"
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$DEST</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict>
+              <key>de.finnarnold.studienportal</key><string>$APP_PROFILE</string>
+              <key>de.finnarnold.studienportal.widgets</key><string>$WIDGET_PROFILE</string>
+              <key>de.finnarnold.studienportal.share</key><string>$SHARE_PROFILE</string>
+            </dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          # Hochladen: bei kurzen Störungen bei Apple bis zu 3 Versuche
+          ok=0
+          for try in 1 2 3; do
+            if xcodebuild -exportArchive -archivePath build/Studienportal.xcarchive \
+                 -exportOptionsPlist build/ExportOptions.plist -exportPath build/export "${AUTH[@]}" > export.log 2>&1; then
+              ok=1; tail -5 export.log; break
+            fi
+            grep -E "error|Error" export.log | sort -u | head -20
+            echo "Versuch $try fehlgeschlagen – neuer Versuch in 30 s"; sleep 30
+          done
+          [ "$ok" = 1 ] || exit 1
+          [ "$DEST" = upload ] || { echo "Probe: unterschrieben, nicht hochgeladen"; ls build/export; exit 0; }
+          echo "Hochgeladen: Version $APP_VERSION ($BUILD_NO). In TestFlight erscheint sie nach der Verarbeitung durch Apple (meist 15–30 Minuten)."
+      - name: Zertifikat und Profile wieder entfernen
+        if: always() && env.HAS_KEYS == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          # Schlüssel für die Abmeldung bei Apple bereitstellen (wird am Ende wieder gelöscht)
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          if [ -x "$RUNNER_TEMP/py/bin/python" ]; then
+            "$RUNNER_TEMP/py/bin/python" .github/scripts/asc_signing.py cleanup || echo "::warning::Zertifikat konnte nicht widerrufen werden"
+          fi
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dist.* ~/.appstoreconnect/private_keys/*.p8
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+      - name: Hinweis
+        if: env.HAS_KEYS != 'true'
+        run: echo "Noch keine Schlüssel hinterlegt – nur Prüfbau. Anleitung siehe docs/IOS-APP.md."
+
+  # Erst wenn Apple den Build verarbeitet hat, ist das Update wirklich in TestFlight (Upload allein reicht nicht)
+  testflight:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Warten, bis der Build in TestFlight ist
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          export BUILD_NUMBER=$(( GITHUB_RUN_NUMBER + $(cat BUILD_OFFSET 2>/dev/null || echo 0) ))
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          pip install -q pyjwt cryptography
+          rc=0; python .github/scripts/asc_wait.py || rc=$?
+          rm -f "$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          exit $rc

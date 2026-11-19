@@ -90,6 +90,9 @@ struct RootView: View {
                 PortalWebView(url: url, model: model).ignoresSafeArea()
                     .task { await BackgroundSync.start() }
                 if let p = model.pencil { PencilOverlay(session: p).id(p.id) }
+                if !model.showAppleMusic && model.pencil == nil {   // Musik läuft weiter: Mini-Player in jedem Bereich
+                    VStack { Spacer(); AMFloatingPlayer(open: { AMRouter.shared.openNowPlaying = true; model.showAppleMusic = true }).padding(.bottom, 74) }
+                }
             } else {
                 SetupView()
             }

@@ -12,9 +12,18 @@ enum ClipSync {
     private static var running = false
     private static let defaults = UserDefaults.standard
 
+    /// Letztes Ergebnis für Einstellungen → App (damit sichtbar ist, was passiert ist)
+    private static func status(_ text: String) {
+        let t = Date().formatted(date: .omitted, time: .shortened)
+        defaults.set("\(t): \(text)", forKey: "clipStatus")
+        let js = "window.portalApp && (portalApp.clipStatus = \(PortalWebView.jsString("\(t): \(text)")))"
+        AppModel.shared?.webView?.evaluateJavaScript(js)
+    }
+
     /// force: vom Knopf im Kontrollzentrum – iPhone → Laptop auch ohne Schalter
     static func onForeground(force: Bool = false) async {
-        guard !running, Shared.appKey != nil else { return }
+        guard !running else { return }
+        guard Shared.appKey != nil else { status("Kein Geräte-Schlüssel – App einmal neu öffnen und angemeldet sein"); return }
         running = true
         defer { running = false }
         let pb = UIPasteboard.general
@@ -22,12 +31,15 @@ enum ClipSync {
         if (force || autoUpload), pb.changeCount != defaults.integer(forKey: "clipSeen"), pb.changeCount != defaults.integer(forKey: "clipOwn") {
             defaults.set(pb.changeCount, forKey: "clipSeen")
             let concealed = pb.types.contains { $0 == "org.nspasteboard.ConcealedType" || $0 == "com.agilebits.onepassword" }
-            if !concealed { await upload(pb) }
+            if concealed { status("iPhone → Laptop übersprungen (vertraulicher Inhalt)") } else { await upload(pb) }
         }
         // 2) Laptop → iPhone
-        guard let data = try? await PortalAPI.raw(["action": "clipLatest", "other": true, "minutes": 10]),
-              let c = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["clip"] as? [String: Any],
-              let id = c["id"] as? String, id != defaults.string(forKey: "clipApplied"), let kind = c["kind"] as? String else { return }
+        let data: Data
+        do { data = try await PortalAPI.raw(["action": "clipLatest", "other": true, "minutes": 10]) }
+        catch { status("Portal nicht erreichbar: \(error.localizedDescription)"); return }
+        guard let c = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["clip"] as? [String: Any],
+              let id = c["id"] as? String, let kind = c["kind"] as? String else { status("Nichts Neues vom Laptop (letzte 10 Min.)"); return }
+        guard id != defaults.string(forKey: "clipApplied") else { status("Neuester Laptop-Eintrag war schon übernommen"); return }
         defaults.set(id, forKey: "clipApplied")
         switch kind {
         case "text": pb.string = c["text"] as? String ?? ""
@@ -45,6 +57,7 @@ enum ClipSync {
         defaults.set(pb.changeCount, forKey: "clipSeen")
         let what = kind == "image" ? "Bild" : kind == "file" ? "„\(c["name"] as? String ?? "Datei")“" : "Text"
         AppModel.toast("\(what) vom \(c["device"] as? String ?? "Laptop") liegt in der Zwischenablage – einfach einfügen")
+        status("\(what) vom \(c["device"] as? String ?? "Laptop") übernommen")
     }
 
     private static func upload(_ pb: UIPasteboard) async {
@@ -54,7 +67,8 @@ enum ClipSync {
             _ = try? await PortalAPI.action(["action": "clip", "text": u.absoluteString])
         } else if pb.hasStrings, let s = pb.string, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             _ = try? await PortalAPI.action(["action": "clip", "text": s])
-        } else { return }
+        } else { status("iPhone-Zwischenablage leer oder nicht lesbar (iOS-Einstellung „Aus anderen Apps einfügen“?)"); return }
         AppModel.toast("iPhone-Zwischenablage ist jetzt auch am Laptop")
+        status("iPhone-Zwischenablage zum Laptop gesendet")
     }
 }

@@ -50,6 +50,7 @@ final class AMRouter: ObservableObject {
     @Published var paths: [NavigationPath] = Array(repeating: NavigationPath(), count: 5)
     @Published var message: String?
     @Published var addToPlaylist: Song?
+    @Published var openNowPlaying = false   // vom schwebenden Mini-Player außerhalb von Apple Music
 
     func push(_ d: AMDest) { paths[tab].append(d) }
     func path(_ i: Int) -> Binding<NavigationPath> { Binding(get: { self.paths[i] }, set: { self.paths[i] = $0 }) }
@@ -114,6 +115,7 @@ struct AppleMusicHome: View {
                 }
                 .tint(amPink)
                 .safeAreaInset(edge: .bottom) { AMMiniPlayer(showNP: $showNP).padding(.bottom, 52) }
+                .onAppear { if router.openNowPlaying { router.openNowPlaying = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { showNP = true } } }
                 .sheet(isPresented: $showNP) { AMNowPlaying(go: { d in showNP = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { router.push(d) } }) }
                 .sheet(item: $router.addToPlaylist) { s in AMAddToPlaylist(song: s) }
                 .overlay(alignment: .top) {
@@ -1136,4 +1138,62 @@ struct AMVolume: UIViewRepresentable {
 struct AMRoute: UIViewRepresentable {
     func makeUIView(context: Context) -> AVRoutePickerView { let v = AVRoutePickerView(); v.tintColor = .white; return v }
     func updateUIView(_ v: AVRoutePickerView, context: Context) {}
+}
+
+
+// MARK: Mini-Player über allen Bereichen der App (ein- und ausklappbar)
+struct AMFloatingPlayer: View {
+    let open: () -> Void
+    @ObservedObject private var state = ApplicationMusicPlayer.shared.state
+    @ObservedObject private var queue = ApplicationMusicPlayer.shared.queue
+    @AppStorage("amMiniCollapsed") private var collapsed = false
+
+    var body: some View {
+        if let e = queue.currentEntry {
+            Group {
+                if collapsed {
+                    Button { withAnimation(.spring(response: 0.35)) { collapsed = false } } label: {
+                        ZStack(alignment: .bottomTrailing) {
+                            AMCover(artwork: e.artwork, size: 52, radius: 26)
+                            Image(systemName: state.playbackStatus == .playing ? "waveform" : "pause.fill")
+                                .font(.caption2.bold()).padding(5).background(amPink, in: Circle()).foregroundStyle(.white)
+                        }
+                        .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
+                    }
+                    .accessibilityLabel("Mini-Player ausklappen")
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                } else {
+                    HStack(spacing: 12) {
+                        AMCover(artwork: e.artwork, size: 42, radius: 6)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(e.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                            if let s = e.subtitle { Text(s).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                        }
+                        Spacer(minLength: 4)
+                        Button { if state.playbackStatus == .playing { ApplicationMusicPlayer.shared.pause() } else { Task { try? await ApplicationMusicPlayer.shared.play() } } } label: {
+                            Image(systemName: state.playbackStatus == .playing ? "pause.fill" : "play.fill").font(.title3).frame(width: 34, height: 34)
+                        }
+                        Button { Task { try? await ApplicationMusicPlayer.shared.skipToNextEntry() } } label: { Image(systemName: "forward.fill").font(.title3).frame(width: 34, height: 34) }
+                        Button { withAnimation(.spring(response: 0.35)) { collapsed = true } } label: { Image(systemName: "chevron.down").font(.subheadline.bold()).frame(width: 28, height: 34) }
+                            .accessibilityLabel("Mini-Player einklappen")
+                    }
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+                    .contentShape(Rectangle())
+                    .onTapGesture { open() }
+                    .gesture(DragGesture(minimumDistance: 24).onEnded { g in
+                        if g.translation.height > 30 { withAnimation(.spring(response: 0.35)) { collapsed = true } }
+                        else if g.translation.height < -40 { open() }
+                        else if g.translation.width < -60 { Task { try? await ApplicationMusicPlayer.shared.skipToNextEntry() } }
+                        else if g.translation.width > 60 { Task { try? await ApplicationMusicPlayer.shared.skipToPreviousEntry() } }
+                    })
+                }
+            }
+            .padding(.horizontal, 12)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .preferredColorScheme(.dark)
+        }
+    }
 }

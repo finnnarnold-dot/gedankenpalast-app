@@ -5,6 +5,12 @@ import UIKit
 /// Das Portal in der App. Ergänzt: Brücke für Mitteilungen/Face ID, Herunterladen (Teilen-Menü),
 /// externe Links in Safari, Kurzbefehle/Mail-Links, Ziehen zum Aktualisieren, Wischen zurück.
 struct PortalWebView: UIViewRepresentable {
+    /// Text sicher als JavaScript-Zeichenkette
+    static func jsString(_ s: String) -> String {
+        guard let d = try? JSONSerialization.data(withJSONObject: [s]), let a = String(data: d, encoding: .utf8) else { return "''" }
+        return String(a.dropFirst().dropLast())
+    }
+
     let url: URL
     let model: AppModel
     var tabMode = false          // in der Tab-Leiste der App: Seitenleiste des Portals ausblenden (keine zwei Wege)
@@ -21,7 +27,7 @@ struct PortalWebView: UIViewRepresentable {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
         let faceID = model.faceID ? "true" : "false"
         let reminders = model.reminders ? "true" : "false"
-        let script = "window.portalApp = { platform: 'ios', version: '\(version)', faceID: \(faceID), reminders: \(reminders), widgets: true, music: true, alerts: \(EventAlerts.enabled ? "true" : "false"), icloud: '\(ICloudSync.status())', clipAuto: \(UserDefaults.standard.bool(forKey: "clipAuto")), assistant: \(AssistantAvailability.available) };"
+        let script = "window.portalApp = { platform: 'ios', version: '\(version)', faceID: \(faceID), reminders: \(reminders), widgets: true, music: true, alerts: \(EventAlerts.enabled ? "true" : "false"), icloud: '\(ICloudSync.status())', clipAuto: \(UserDefaults.standard.bool(forKey: "clipAuto")), clipStatus: \(Self.jsString(UserDefaults.standard.string(forKey: "clipStatus") ?? "")), assistant: \(AssistantAvailability.available) };"
             + "document.documentElement.classList.add('ios-app');"
             + (tabMode ? "document.documentElement.classList.add('ios-tabs');" : "")
         ucc.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))

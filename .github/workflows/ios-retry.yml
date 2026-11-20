@@ -31,7 +31,7 @@ jobs:
           [ "$(newest)" = "$SHA" ] || { echo "Neuerer Stand vorhanden – kein Neustart"; exit 0; }
           never_ran "$RUN" || { echo "Bau lief und ist fehlgeschlagen – das muss im Code behoben werden"; exit 0; }
           for n in 1 2 3 4 5 6; do
-            runner=$([ $((n % 2)) = 1 ] && echo macos-26 || echo macos-15)
+            runner=$(case $((n % 3)) in 1) echo macos-15-intel;; 2) echo macos-26;; *) echo macos-15;; esac)   # Intel-Macs: eigener, meist freier Topf
             echo "Kein freier Mac – Versuch $n in 30 Sekunden auf $runner"
             sleep 30
             before=$(gh api "repos/$REPO/actions/workflows/ios.yml/runs?per_page=1" --jq '.workflow_runs[0].id')

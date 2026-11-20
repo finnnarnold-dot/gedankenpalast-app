@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Mac-Typ (Xcode 26 nötig: macos-26 oder macos-15)'
+        description: 'Mac-Typ (Xcode 26 nötig: macos-15, macos-26 oder macos-15-intel)'
         required: false
         default: 'macos-15'
       attempt:

@@ -106,10 +106,9 @@ struct RootView: View {
         .fullScreenCover(isPresented: Binding(get: { model.embedURL != nil && !model.locked }, set: { if !$0 { model.embedURL = nil } })) {
             if let url = model.embedURL { EmbedView(url: url).environmentObject(model) }
         }
-        .fullScreenCover(isPresented: Binding(get: { model.showAppleMusic && !model.locked }, set: { model.showAppleMusic = $0 }), onDismiss: {
-            // zurück zur Seite vor „Musik“ (keine Zwischenseite)
-            model.webView?.evaluateJavaScript("if (location.hash.startsWith('#/musik')) { history.length > 1 ? history.back() : (location.hash = '#/portal') }", completionHandler: nil)
-        }) {
+        // Nach dem Schließen bleibt die Musik-Seite stehen (Reiter Musik | Schach | Rechner) – vorher ging es zurück,
+        // dadurch war Schach in der App nicht erreichbar (Finn, Verbesserungsnotiz 20.11.)
+        .fullScreenCover(isPresented: Binding(get: { model.showAppleMusic && !model.locked }, set: { model.showAppleMusic = $0 })) {
             AppleMusicHome().environmentObject(model)
         }
     }

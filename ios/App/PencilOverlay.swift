@@ -1,6 +1,7 @@
 import SwiftUI
 import PencilKit
 import WebKit
+import Vision
 
 // Apple Pencil direkt in der Notiz (Website-Design): Pencil auf den Notiztext → Apples Zeichenfläche liegt sofort darüber
 // (erster Strich wird übernommen), Pencil auf eine Zeichnung → weiterzeichnen. Fingertipp → Handschrift wird an der
@@ -76,6 +77,7 @@ struct PencilOverlay: View {
     @EnvironmentObject var model: AppModel
     @State private var canvas = PKCanvasView()
     @State private var busy = false
+    @AppStorage("pencilMode") private var mode = "zeichnung"   // „zeichnung“ oder „text“ (Handschrift → Schrift)
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -83,6 +85,13 @@ struct PencilOverlay: View {
                 .ignoresSafeArea()
             HStack(spacing: 10) {
                 if busy { ProgressView() }
+                if session.replaceSrc == nil {   // beim Weiterzeichnen bleibt es eine Zeichnung
+                    Picker("Einfügen als", selection: $mode) {
+                        Text("Zeichnung").tag("zeichnung")
+                        Text("Text").tag("text")
+                    }
+                    .pickerStyle(.segmented).frame(width: 190)
+                }
                 Button("Abbrechen") { model.pencil = nil }.buttonStyle(.bordered)
                 Button("Fertig") { finish() }.buttonStyle(.borderedProminent).tint(Theme.accent)
             }
@@ -101,12 +110,56 @@ struct PencilOverlay: View {
         let strokes = d.dataRepresentation().base64EncodedString()
         let start = session.replaceSrc == nil ? CGPoint(x: rect.minX + 4, y: rect.minY + 4) : session.start
         let replace = session.replaceSrc
+        let asText = mode == "text" && replace == nil
+        var ocrImage = UIImage()
+        if asText {   // für die Erkennung: dunkle Tinte auf Weiß
+            UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+                let ink = d.image(from: rect, scale: 2)
+                ocrImage = UIGraphicsImageRenderer(size: ink.size).image { ctx in
+                    UIColor.white.setFill(); ctx.fill(CGRect(origin: .zero, size: ink.size)); ink.draw(at: .zero)
+                }
+            }
+        }
         Task {
             defer { busy = false; model.pencil = nil }
+            if asText {
+                let text = await Self.recognize(ocrImage)
+                if !text.isEmpty {
+                    let js = "window.portalInsertText && portalInsertText(\(jsString(text)), \(start.x), \(start.y))"
+                    _ = try? await model.webView?.evaluateJavaScript(js)
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    return
+                }
+                AppModel.toast("Keine Schrift erkannt – als Zeichnung eingefügt")
+            }
             guard let png = img.pngData(), let url = await PencilUpload.upload(png, model: model) else { return }
             let js = "window.portalInsertDrawing && portalInsertDrawing(\(jsString(url)), \(jsString(strokes)), \(start.x), \(start.y), \(replace.map(jsString) ?? "null"))"
             _ = try? await model.webView?.evaluateJavaScript(js)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
+    }
+
+    /// Handschrift → Text auf dem Gerät (Vision, ohne Internet); Zeilen von oben nach unten
+    static func recognize(_ image: UIImage) async -> String {
+        guard let cg = image.cgImage else { return "" }
+        final class Once: @unchecked Sendable {   // Vision kann bei Fehlern doppelt melden – nur einmal antworten
+            private let lock = NSLock(); private var done = false
+            func run(_ f: () -> Void) { lock.lock(); defer { lock.unlock() }; if !done { done = true; f() } }
+        }
+        return await withCheckedContinuation { c in
+            let once = Once()
+            let req = VNRecognizeTextRequest { r, _ in
+                let lines = (r.results as? [VNRecognizedTextObservation] ?? [])
+                    .sorted { $0.boundingBox.minY > $1.boundingBox.minY }
+                    .compactMap { $0.topCandidates(1).first?.string }
+                once.run { c.resume(returning: lines.joined(separator: "\n")) }
+            }
+            req.recognitionLevel = .accurate
+            req.usesLanguageCorrection = true
+            req.recognitionLanguages = ["de-DE", "en-US"]
+            DispatchQueue.global(qos: .userInitiated).async {
+                do { try VNImageRequestHandler(cgImage: cg).perform([req]) } catch { once.run { c.resume(returning: "") } }
+            }
         }
     }
 

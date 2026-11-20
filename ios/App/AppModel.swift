@@ -297,8 +297,10 @@ final class AppModel: ObservableObject {
 
 /// Einweg-Abgleich: Fristen und offene Lernaufgaben aus dem Portal erscheinen in Apple Erinnerungen
 /// (Liste „Gedankenpalast“). Bereits angelegte werden nicht doppelt angelegt; Abhaken in Erinnerungen bleibt dort.
+@MainActor
 enum ReminderSync {
     static let store = EKEventStore()
+    private static var running = false   // nie zwei Abgleiche gleichzeitig (EKEventStore verträgt das nicht → Absturz)
 
     static func requestAccess() async -> Bool {
         if #available(iOS 17.0, *) { return (try? await store.requestFullAccessToReminders()) ?? false }
@@ -318,7 +320,9 @@ enum ReminderSync {
     }
 
     static func sync(_ s: PortalSummary) async {
-        guard EKEventStore.authorizationStatus(for: .reminder) == statusFull, let cal = list() else { return }
+        guard !running, EKEventStore.authorizationStatus(for: .reminder) == statusFull, let cal = list() else { return }
+        running = true
+        defer { running = false }
         var known = Set(UserDefaults.standard.stringArray(forKey: "reminderKeys") ?? [])
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
         // Rückweg: in Erinnerungen abgehakte Lernaufgaben → im Portal erledigt
